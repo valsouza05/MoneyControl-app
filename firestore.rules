@@ -1,0 +1,31 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Transactions stored flat under /transactions/{docId}
+    match /transactions/{docId} {
+
+      // Allow document reads only if the document belongs to the auth user
+      allow get: if request.auth != null && resource.data.userId == request.auth.uid;
+
+      // Allow queries (list) only when the query includes a filter userId == request.auth.uid
+      allow list: if request.auth != null && request.query.where('userId', '==', request.auth.uid);
+
+      // Create only if payload contains required fields and userId matches authenticated user
+      allow create: if request.auth != null
+        && request.resource.data.keys().hasAll(['userId', 'tipo', 'valor', 'categoria', 'data'])
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.tipo in ['receita', 'despesa']
+        && request.resource.data.valor is number
+        && request.resource.data.valor > 0;
+
+      // Update only if document belongs to user and userId is unchanged
+      allow update: if request.auth != null
+        && resource.data.userId == request.auth.uid
+        && request.resource.data.userId == request.auth.uid;
+
+      // Delete only if document belongs to user
+      allow delete: if request.auth != null && resource.data.userId == request.auth.uid;
+    }
+  }
+}

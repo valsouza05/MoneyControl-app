@@ -1,0 +1,28 @@
+{
+  "rules": {
+    "transactions": {
+      "$uid": {
+        ".read": "request.auth.uid == $uid",
+        ".write": "request.auth.uid == $uid",
+        ".validate": "newData.hasChildren(['userId', 'tipo', 'valor', 'categoria', 'data'])",
+        "$docId": {
+          "userId": {
+            ".validate": "newData.val() == request.auth.uid"
+          },
+          "tipo": {
+            ".validate": "newData.val() == 'receita' || newData.val() == 'despesa'"
+          },
+          "valor": {
+            ".validate": "newData.val() > 0"
+          },
+          "categoria": {
+            ".validate": "newData.isString() && newData.val().length > 0"
+          },
+          "data": {
+            ".validate": "newData.isString() && newData.val().length == 10"
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,35 +1,29 @@
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Print from 'expo-print';
+import { useRouter } from 'expo-router';
 import * as Sharing from 'expo-sharing';
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import {
-  Alert,
-  FlatList,
-  Pressable,
-  ScrollView,
-  StyleSheet,
-  Text,
-  TextInput,
-  View,
+    ActivityIndicator,
+    Alert,
+    FlatList,
+    Pressable,
+    ScrollView,
+    StyleSheet,
+    Text,
+    TextInput,
+    View,
 } from 'react-native';
-
 import { MoneyIcon } from '../../components/money-icon';
+import { StatusBar } from '../../components/status-bar';
 import { ThemedText } from '../../components/themed-text';
 import { ThemedView } from '../../components/themed-view';
+import { useAuth } from '../../hooks/useAuth';
+import { Transaction, TransactionType, useFirebaseTransactions } from '../../hooks/useFirebaseTransactions';
 
 const CATEGORIES = ['Alimentação', 'Transporte', 'Lazer', 'Moradia', 'Outros'] as const;
 type Category = (typeof CATEGORIES)[number];
 
 type Period = 'all' | 'day' | 'week' | 'month';
-type TransactionType = 'receita' | 'despesa';
-
-type Transaction = {
-  id: string;
-  value: number;
-  category: Category;
-  date: string;
-  type: TransactionType;
-};
 
 const DATE_PATTERN = /^\d{2}\/\d{2}\/\d{4}$/;
 const PRIMARY_60 = 'rgba(10, 126, 164, 0.6)';
@@ -53,55 +47,98 @@ function formatDateToBR(date: Date) {
 
 const TODAY_DATE = formatDateToBR(new Date());
 
-const STORAGE_KEY = 'moneycontrol:transactions';
-
 function parseDate(dateString: string) {
   const [day, month, year] = dateString.split('/');
   return new Date(Number(year), Number(month) - 1, Number(day));
 }
 
+// Convert between our types and Firebase types
+interface FirestoreTransaction extends Transaction {
+  tipo: TransactionType;
+  valor: number;
+  data: string;
+}
+
+interface DisplayTransaction {
+  id: string;
+  value: number;
+  category: Category;
+  date: string;
+  type: TransactionType;
+}
+
+function firestoreToDisplay(tx: FirestoreTransaction): DisplayTransaction {
+  return {
+    id: tx.id,
+    value: tx.valor,
+    category: tx.categoria as Category,
+    date: tx.data,
+    type: tx.tipo,
+  };
+}
+
+function displayToFirestore(tx: DisplayTransaction): Omit<FirestoreTransaction, 'id' | 'userId'> {
+  return {
+    tipo: tx.type,
+    valor: tx.value,
+    categoria: tx.category,
+    data: tx.date,
+  } as any;
+}
+
 export default function HomeScreen() {
+  const firebase = useFirebaseTransactions();
+  const auth = useAuth();
+  const router = useRouter();
   const [value, setValue] = useState('');
   const [category, setCategory] = useState<Category>('Alimentação');
   const [date, setDate] = useState(TODAY_DATE);
-  const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [period, setPeriod] = useState<Period>('all');
-  const [nextId, setNextId] = useState(1);
   const [transactionType, setTransactionType] = useState<TransactionType>('despesa');
-  const [isExporting, setIsExporting] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
 
-  useEffect(() => {
-    const loadTransactions = async () => {
-      try {
-        const stored = await AsyncStorage.getItem(STORAGE_KEY);
-        if (stored) {
-          const parsed = JSON.parse(stored) as Transaction[];
-          setTransactions(parsed);
-        }
-      } catch (error) {
-        console.warn('Falha ao carregar transações:', error);
+  const displayTransactions: DisplayTransaction[] = useMemo(
+    () => firebase.transactions.map(firestoreToDisplay),
+    [firebase.transactions]
+  );
+
+  const filteredTransactions = useMemo(() => {
+    if (period === 'all') {
+      return displayTransactions;
+    }
+
+    const now = new Date();
+    return displayTransactions.filter((transaction) => {
+      const transactionDate = parseDate(transaction.date);
+      if (Number.isNaN(transactionDate.getTime())) {
+        return false;
       }
-    };
 
-    loadTransactions();
-  }, []);
-
-  useEffect(() => {
-    const saveTransactions = async () => {
-      try {
-        await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(transactions));
-      } catch (error) {
-        console.warn('Falha ao salvar transações:', error);
+      const diffDays = Math.floor((now.getTime() - transactionDate.getTime()) / (1000 * 60 * 60 * 24));
+      if (period === 'day') {
+        return diffDays === 0;
       }
-    };
+      if (period === 'week') {
+        return diffDays >= 0 && diffDays < 7;
+      }
+      if (period === 'month') {
+        return diffDays >= 0 && diffDays < 31;
+      }
+      return true;
+    });
+  }, [displayTransactions, period]);
 
-    saveTransactions();
-  }, [transactions]);
+  const totalExpenses = filteredTransactions
+    .filter((t) => t.type === 'despesa')
+    .reduce((sum, transaction) => sum + transaction.value, 0);
+  const totalIncome = filteredTransactions
+    .filter((t) => t.type === 'receita')
+    .reduce((sum, transaction) => sum + transaction.value, 0);
+  const net = totalIncome - totalExpenses;
+  const availableBalance = totalIncome - totalExpenses;
 
-  const selectedTransaction = transactions.find((transaction) => transaction.id === editingId) ?? null;
-
-  const handleSave = () => {
+  const handleSave = async () => {
     const normalizedValue = value.replace(/\./g, '').replace(',', '.').trim();
     const parsedValue = Number(normalizedValue);
     if (Number.isNaN(parsedValue) || parsedValue <= 0) {
@@ -114,31 +151,65 @@ export default function HomeScreen() {
       return;
     }
 
-    const transactionCategory = transactionType === 'receita' ? 'Outros' : category;
-    const transactionData: Transaction = {
-      id: editingId ?? `transaction_${nextId}`,
-      value: parsedValue,
-      category: transactionCategory,
-      date,
-      type: transactionType,
-    };
+    setIsSaving(true);
+    try {
+      const transactionData = {
+        tipo: transactionType,
+        valor: parsedValue,
+        categoria: category,
+        data: date,
+      };
 
-    setTransactions((current) => {
       if (editingId) {
-        return current.map((item) => (item.id === editingId ? transactionData : item));
+        await firebase.updateTransaction(editingId, {
+          ...transactionData,
+          id: editingId,
+          userId: '',
+        });
+      } else {
+        await firebase.addTransaction(transactionData);
       }
-      setNextId((prev) => prev + 1);
-      return [transactionData, ...current];
-    });
 
-    setValue('');
-    setDate(TODAY_DATE);
-    setCategory('Alimentação');
-    setTransactionType('despesa');
-    setEditingId(null);
+      setValue('');
+      setDate(TODAY_DATE);
+      setCategory('Alimentação');
+      setTransactionType('despesa');
+      setEditingId(null);
+    } catch (err) {
+      alert('Erro ao salvar transação. Tente novamente.');
+      console.error('Erro:', err);
+    } finally {
+      setIsSaving(false);
+    }
   };
 
-  const handleEdit = (transaction: Transaction) => {
+  const exportMonthlyPDF = async () => {
+    try {
+      const now = new Date();
+      const month = now.getMonth();
+      const year = now.getFullYear();
+      const monthly = filteredTransactions.filter((t) => {
+        const [d, m, y] = t.date.split('/').map(Number);
+        return m - 1 === month && y === year;
+      });
+
+      let html = `<h1>Relatório Mensal - ${month + 1}/${year}</h1><table border="1" cellpadding="6" cellspacing="0"><tr><th>Data</th><th>Tipo</th><th>Categoria</th><th>Valor</th><th>Descrição</th></tr>`;
+      for (const t of monthly) {
+        html += `<tr><td>${t.date}</td><td>${t.type}</td><td>${t.category}</td><td>${t.value.toFixed(2)}</td><td>${t.descricao || ''}</td></tr>`;
+      }
+      html += `</table>`;
+
+      const { uri } = await Print.printToFileAsync({ html });
+      if (uri) {
+        await Sharing.shareAsync(uri, { dialogTitle: 'Relatório mensal' });
+      }
+    } catch (err) {
+      console.error('Erro ao exportar PDF:', err);
+      Alert.alert('Erro', 'Falha ao gerar o PDF.');
+    }
+  };
+
+  const handleEdit = (transaction: DisplayTransaction) => {
     setEditingId(transaction.id);
     setValue(transaction.value.toString());
     setCategory(transaction.category);
@@ -158,14 +229,19 @@ export default function HomeScreen() {
         },
         {
           text: 'Excluir',
-          onPress: () => {
-            setTransactions((current) => current.filter((transaction) => transaction.id !== id));
-            if (editingId === id) {
-              setEditingId(null);
-              setValue('');
-              setDate(TODAY_DATE);
-              setCategory('Alimentação');
-              setTransactionType('despesa');
+          onPress: async () => {
+            try {
+              await firebase.deleteTransaction(id);
+              if (editingId === id) {
+                setEditingId(null);
+                setValue('');
+                setDate(TODAY_DATE);
+                setCategory('Alimentação');
+                setTransactionType('despesa');
+              }
+            } catch (err) {
+              alert('Erro ao deletar transação. Tente novamente.');
+              console.error('Erro:', err);
             }
           },
           style: 'destructive',
@@ -174,97 +250,6 @@ export default function HomeScreen() {
     );
   };
 
-  const exportMonthlyPDF = async () => {
-    try {
-      const now = new Date();
-      const month = now.getMonth();
-      const year = now.getFullYear();
-      const monthlyTransactions = filteredTransactions.filter((transaction) => {
-        const [day, monthString, yearString] = transaction.date.split('/').map(Number);
-        return monthString - 1 === month && yearString === year;
-      });
-
-      if (monthlyTransactions.length === 0) {
-        Alert.alert('Nenhuma transação', 'Não há transações para o mês atual.');
-        return;
-      }
-
-      const rows = monthlyTransactions
-        .map(
-          (transaction) =>
-            `<tr><td>${transaction.date}</td><td>${transaction.type}</td><td>${transaction.category}</td><td>${formatCurrency(transaction.value)}</td></tr>`
-        )
-        .join('');
-
-      const html = `
-        <html>
-          <head>
-            <meta charset="utf-8" />
-            <title>Relatório Mensal</title>
-            <style>
-              body { font-family: Arial, sans-serif; padding: 24px; }
-              table { width: 100%; border-collapse: collapse; margin-top: 16px; }
-              th, td { border: 1px solid #cccccc; padding: 8px; text-align: left; }
-              th { background: #0a7ea4; color: white; }
-            </style>
-          </head>
-          <body>
-            <h1>Relatório Mensal - ${month + 1}/${year}</h1>
-            <table>
-              <tr><th>Data</th><th>Tipo</th><th>Categoria</th><th>Valor</th></tr>
-              ${rows}
-            </table>
-          </body>
-        </html>`;
-
-      setIsExporting(true);
-      const { uri } = await Print.printToFileAsync({ html });
-      if (uri) {
-        await Sharing.shareAsync(uri, { dialogTitle: 'Relatório mensal' });
-      }
-    } catch (error) {
-      console.error('Erro ao exportar PDF:', error);
-      Alert.alert('Erro', 'Falha ao gerar o PDF. Tente novamente.');
-    } finally {
-      setIsExporting(false);
-    }
-  };
-
-  const filteredTransactions = useMemo(() => {
-    if (period === 'all') {
-      return transactions;
-    }
-
-    const now = new Date();
-    return transactions.filter((transaction) => {
-      const transactionDate = parseDate(transaction.date);
-      if (Number.isNaN(transactionDate.getTime())) {
-        return false;
-      }
-
-      const diffDays = Math.floor((now.getTime() - transactionDate.getTime()) / (1000 * 60 * 60 * 24));
-      if (period === 'day') {
-        return diffDays === 0;
-      }
-      if (period === 'week') {
-        return diffDays >= 0 && diffDays < 7;
-      }
-      if (period === 'month') {
-        return diffDays >= 0 && diffDays < 31;
-      }
-      return true;
-    });
-  }, [transactions, period]);
-
-  const totalExpenses = filteredTransactions
-    .filter((t) => t.type === 'despesa')
-    .reduce((sum, transaction) => sum + transaction.value, 0);
-  const totalIncome = filteredTransactions
-    .filter((t) => t.type === 'receita')
-    .reduce((sum, transaction) => sum + transaction.value, 0);
-  const net = totalIncome - totalExpenses;
-  const availableBalance = totalIncome - totalExpenses;
-
   return (
     <ScrollView
       style={styles.page}
@@ -272,26 +257,63 @@ export default function HomeScreen() {
       keyboardShouldPersistTaps="handled"
       keyboardDismissMode="on-drag"
     >
+      {!auth.user ? (
+        <ThemedView style={styles.card}>
+          <ThemedText type="subtitle">Acesse sua conta</ThemedText>
+          <ThemedText style={{ marginTop: 8 }}>Para sincronizar suas transações, faça login ou crie uma conta.</ThemedText>
+          <Pressable
+            style={[styles.saveButton, { marginTop: 12 }]}
+            onPress={() => router.push('auth')}
+          >
+            <Text style={styles.saveButtonText}>Entrar / Criar conta</Text>
+          </Pressable>
+        </ThemedView>
+      ) : null}
+      <StatusBar isOnline={firebase.isOnline} isLoading={firebase.loading} error={firebase.error} />
+
       <ThemedView style={styles.heroSection}>
         <MoneyIcon />
         <ThemedText type="title" style={styles.title}>
           Money Control
         </ThemedText>
+        {!firebase.isOnline && <ThemedText style={styles.offlineLabel}>📴 Offline</ThemedText>}
       </ThemedView>
+
+      {auth.user ? (
+        <ThemedView style={styles.card}>
+          <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+            <View>
+              <ThemedText type="subtitle">Conectado como</ThemedText>
+              <ThemedText style={{ marginTop: 6, fontWeight: '600' }}>{auth.user.email}</ThemedText>
+            </View>
+            <Pressable
+              style={[styles.saveButton, { backgroundColor: '#d32f2f', paddingVertical: 10, paddingHorizontal: 12, borderRadius: 12 }]}
+              onPress={async () => {
+                try {
+                  await auth.signOut();
+                  router.push('auth');
+                } catch (err) {
+                  Alert.alert('Erro', auth.error ?? 'Falha ao sair.');
+                }
+              }}
+            >
+              <Text style={styles.saveButtonText}>Sair</Text>
+            </Pressable>
+          </View>
+        </ThemedView>
+      ) : null}
 
       <ThemedView style={styles.card}>
         <ThemedText type="subtitle">Saldo da conta</ThemedText>
         <ThemedText style={styles.label}>Valor do saldo</ThemedText>
         <ThemedText style={styles.balanceValue}>{formatCurrency(availableBalance)}</ThemedText>
-        <ThemedText style={styles.balanceText}>Saldo disponível: {formatCurrency(availableBalance)}</ThemedText>
+        <ThemedText style={styles.balanceText}>
+          Saldo disponível: {formatCurrency(availableBalance)}
+        </ThemedText>
       </ThemedView>
 
       <ThemedView style={styles.card}>
-        <ThemedText
-          type="subtitle"
-          style={{ color: transactionType === 'receita' ? INCOME_COLOR : EXPENSE_COLOR }}>
-          {transactionType === 'receita' ? 'Nova receita' : 'Nova despesa'}
-        </ThemedText>
+        <ThemedText type="subtitle">Nova transação</ThemedText>
 
         <ThemedText style={styles.label}>Tipo</ThemedText>
         <View style={styles.categoryRow}>
@@ -320,8 +342,8 @@ export default function HomeScreen() {
                 styles.incomeButtonText,
                 transactionType === 'receita' ? styles.incomeButtonTextSelected : undefined,
               ]}>
-                Receita
-              </Text>
+              Receita
+            </Text>
           </Pressable>
         </View>
 
@@ -332,34 +354,29 @@ export default function HomeScreen() {
           placeholder="1234.56"
           keyboardType="decimal-pad"
           style={styles.input}
+          editable={!isSaving}
         />
 
-        {transactionType === 'despesa' ? (
-          <>
-            <ThemedText style={styles.label}>Categoria</ThemedText>
-            <View style={styles.categoryRow}>
-              {CATEGORIES.map((item) => (
-                <Pressable
-                  key={item}
-                  onPress={() => setCategory(item)}
-                  style={[
-                    styles.categoryButton,
-                    category === item ? styles.categoryButtonSelected : undefined,
-                  ]}>
-                  <Text
-                    style={[
-                      styles.categoryButtonText,
-                      category === item ? styles.categoryButtonTextSelected : undefined,
-                    ]}>
-                    {item}
-                  </Text>
-                </Pressable>
-              ))}
-            </View>
-          </>
-        ) : (
-          <ThemedText style={styles.helperText}>Categoria não é necessária para receitas.</ThemedText>
-        )}
+        <ThemedText style={styles.label}>Categoria</ThemedText>
+        <View style={styles.categoryRow}>
+          {CATEGORIES.map((item) => (
+            <Pressable
+              key={item}
+              onPress={() => setCategory(item)}
+              style={[
+                styles.categoryButton,
+                category === item ? styles.categoryButtonSelected : undefined,
+              ]}>
+              <Text
+                style={[
+                  styles.categoryButtonText,
+                  category === item ? styles.categoryButtonTextSelected : undefined,
+                ]}>
+                {item}
+              </Text>
+            </Pressable>
+          ))}
+        </View>
 
         <ThemedText style={styles.label}>Data</ThemedText>
         <TextInput
@@ -367,18 +384,17 @@ export default function HomeScreen() {
           onChangeText={setDate}
           placeholder="DD/MM/AAAA"
           style={styles.input}
+          editable={!isSaving}
         />
 
-        <Pressable style={styles.saveButton} onPress={handleSave}>
-          <Text style={styles.saveButtonText}>
-            {editingId
-              ? transactionType === 'receita'
-                ? 'Atualizar receita'
-                : 'Atualizar despesa'
-              : transactionType === 'receita'
-              ? 'Adicionar receita'
-              : 'Adicionar despesa'}
-          </Text>
+        <Pressable style={[styles.saveButton, isSaving && styles.saveButtonDisabled]} onPress={handleSave} disabled={isSaving}>
+          {isSaving ? (
+            <ActivityIndicator color="#fff" size="small" />
+          ) : (
+            <Text style={styles.saveButtonText}>
+              {editingId ? 'Atualizar transação' : 'Adicionar transação'}
+            </Text>
+          )}
         </Pressable>
       </ThemedView>
 
@@ -410,22 +426,24 @@ export default function HomeScreen() {
           ))}
         </View>
 
-        <Pressable
-          style={[styles.saveButton, isExporting && styles.saveButtonDisabled]}
-          onPress={exportMonthlyPDF}
-          disabled={isExporting}
-        >
-          <Text style={styles.saveButtonText}>{isExporting ? 'Gerando PDF...' : 'Exportar PDF mensal'}</Text>
-        </Pressable>
-
+        <ThemedText style={styles.totalLabel}>Receitas: {formatCurrency(totalIncome)}</ThemedText>
+        <ThemedText style={styles.totalLabel}>Despesas: {formatCurrency(totalExpenses)}</ThemedText>
         <ThemedText style={[styles.totalLabel, { color: net >= 0 ? INCOME_COLOR : EXPENSE_COLOR }]}>
           Líquido: {formatCurrency(net)}
         </ThemedText>
+        <Pressable style={[styles.saveButton, { marginTop: 12 }]} onPress={exportMonthlyPDF}>
+          <Text style={styles.saveButtonText}>Exportar PDF mensal</Text>
+        </Pressable>
       </ThemedView>
 
       <ThemedView style={styles.card}>
         <ThemedText type="subtitle">Transações cadastradas</ThemedText>
-        {filteredTransactions.length === 0 ? (
+        {firebase.loading ? (
+          <View style={styles.centerContent}>
+            <ActivityIndicator size="large" color="#0a7ea4" />
+            <ThemedText style={{ marginTop: 12 }}>Carregando transações...</ThemedText>
+          </View>
+        ) : filteredTransactions.length === 0 ? (
           <ThemedText>Nenhuma transação encontrada para o período selecionado.</ThemedText>
         ) : (
           <FlatList
@@ -433,26 +451,30 @@ export default function HomeScreen() {
             keyExtractor={(item) => item.id}
             style={styles.list}
             contentContainerStyle={styles.listContent}
+            scrollEnabled={false}
             renderItem={({ item }) => (
-              <ThemedView style={[
-                styles.expenseItem,
-                item.type === 'receita' ? styles.incomeItem : undefined
-              ]}>
+              <ThemedView
+                style={[styles.expenseItem, item.type === 'receita' ? styles.incomeItem : undefined]}>
                 <View style={styles.expenseInfo}>
-                  <ThemedText style={[
-                    styles.expenseAmount,
-                    item.type === 'receita' ? { color: INCOME_COLOR } : { color: EXPENSE_COLOR }
-                  ]} type="defaultSemiBold">
+                  <ThemedText
+                    style={[
+                      styles.expenseAmount,
+                      item.type === 'receita' ? { color: INCOME_COLOR } : { color: EXPENSE_COLOR },
+                    ]}
+                    type="defaultSemiBold">
                     {item.type === 'receita' ? '+' : '-'} {formatCurrency(item.value)}
                   </ThemedText>
                   <ThemedText>{item.category}</ThemedText>
                   <ThemedText>{item.date}</ThemedText>
                 </View>
                 <View style={styles.expenseActions}>
-                  <Pressable style={styles.actionButton} onPress={() => handleEdit(item)}>
+                  <Pressable style={styles.actionButton} onPress={() => handleEdit(item)} disabled={isSaving}>
                     <Text style={styles.actionText}>Editar</Text>
                   </Pressable>
-                  <Pressable style={[styles.actionButton, styles.deleteButton]} onPress={() => handleDelete(item.id)}>
+                  <Pressable
+                    style={[styles.actionButton, styles.deleteButton]}
+                    onPress={() => handleDelete(item.id)}
+                    disabled={isSaving}>
                     <Text style={[styles.actionText, styles.deleteText]}>Excluir</Text>
                   </Pressable>
                 </View>
@@ -474,6 +496,11 @@ const styles = StyleSheet.create({
     padding: 16,
     paddingBottom: 32,
   },
+  centerContent: {
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingVertical: 32,
+  },
   heroSection: {
     marginBottom: 16,
     padding: 16,
@@ -487,6 +514,12 @@ const styles = StyleSheet.create({
     lineHeight: 40,
     textAlign: 'center',
   },
+  offlineLabel: {
+    marginTop: 8,
+    fontSize: 12,
+    color: '#f57c00',
+    fontWeight: '600',
+  },
   card: {
     borderRadius: 18,
     padding: 16,
@@ -496,6 +529,7 @@ const styles = StyleSheet.create({
     shadowRadius: 16,
     shadowOffset: { width: 0, height: 4 },
     elevation: 3,
+    marginBottom: 16,
   },
   label: {
     marginTop: 12,
@@ -535,10 +569,24 @@ const styles = StyleSheet.create({
   categoryButtonTextSelected: {
     color: '#fff',
   },
-  helperText: {
-    marginTop: 12,
-    color: '#6c757d',
-    fontStyle: 'italic',
+  incomeButton: {
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: INCOME_COLOR,
+    backgroundColor: INCOME_COLOR_LIGHT,
+    marginRight: 8,
+    marginBottom: 8,
+  },
+  incomeButtonSelected: {
+    backgroundColor: INCOME_COLOR_MEDIUM,
+  },
+  incomeButtonText: {
+    color: INCOME_COLOR,
+  },
+  incomeButtonTextSelected: {
+    color: '#fff',
   },
   saveButton: {
     marginTop: 16,
@@ -553,12 +601,6 @@ const styles = StyleSheet.create({
   saveButtonText: {
     color: '#fff',
     fontWeight: '700',
-  },
-  balanceValue: {
-    marginTop: 6,
-    fontSize: 28,
-    fontWeight: '800',
-    color: '#0a7ea4',
   },
   balanceText: {
     marginTop: 12,
@@ -627,6 +669,7 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#0a7ea4',
     backgroundColor: 'transparent',
+    marginLeft: 8,
   },
   actionText: {
     color: '#0a7ea4',
@@ -637,25 +680,6 @@ const styles = StyleSheet.create({
   },
   deleteText: {
     color: '#d32f2f',
-  },
-  incomeButton: {
-    paddingVertical: 10,
-    paddingHorizontal: 12,
-    borderRadius: 999,
-    borderWidth: 1,
-    borderColor: INCOME_COLOR,
-    backgroundColor: INCOME_COLOR_LIGHT,
-    marginRight: 8,
-    marginBottom: 8,
-  },
-  incomeButtonSelected: {
-    backgroundColor: INCOME_COLOR_MEDIUM,
-  },
-  incomeButtonText: {
-    color: INCOME_COLOR,
-  },
-  incomeButtonTextSelected: {
-    color: '#fff',
   },
   incomeItem: {
     backgroundColor: INCOME_COLOR_LIGHT,
